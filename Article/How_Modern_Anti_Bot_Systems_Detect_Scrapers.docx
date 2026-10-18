@@ -1,1 +1,523 @@
+HOW MODERN
+ANTI-BOT SYSTEMS
+DETECT SCRAPERS
+TLS fingerprints, HTTP semantics, browser execution, and behavioural evidence
+
+A practical engineering examination of the signals used to distinguish automated collection from ordinary interactive traffic
+
+TECHNICAL REVIEW • WITH A REPRODUCIBLE, LOCAL DEMONSTRATION
+Scope: defensive detection, observability, and responsible testing
+
+ Abstract
+Modern anti-bot systems rarely make a reliable decision from one conspicuous signal. They combine transport-layer characteristics, HTTP request semantics, session continuity, browser-side execution, interaction patterns, and the context of a request over time. The practical question is not simply whether a request came from Python, a browser, or a particular IP address. It is whether the total evidence is consistent with the kind of client, user journey, and access pattern the service expects. A single signal is usually weak: a legitimate integration may use a non-browser HTTP client, a browser may be automated for testing, and many real users behave in ways that look unusual. Detection quality therefore depends on evidence fusion, calibrated thresholds, and a deliberate strategy for handling uncertainty.
+This article follows the request from the TLS handshake through HTTP parsing and application behaviour. It explains what JA3-style TLS fingerprints can and cannot tell an operator, why header order and protocol details can expose client-library differences, how JavaScript execution and session state add context, and why behavioural analysis is better treated as a sequence-level problem than as a list of rigid rules. A small experiment compares a plain Python requests call with a normal browser request against a local observation endpoint. The experiment is designed to make differences visible without attempting to bypass a third-party service or produce an evasion recipe.
+The central conclusion is straightforward: robust bot management is a layered inference problem. It works best when signals are independently understood, correlated carefully, evaluated against legitimate traffic, and connected to proportionate responses.
+1. The detection problem is broader than scraping
+Scraping is automated retrieval of information from a website or service. It is not inherently malicious: search indexing, accessibility tooling, price monitoring, research, archiving, and approved data integrations all rely on automated access. The same mechanisms can also support abusive collection, credential stuffing, inventory hoarding, content theft, or attempts to overload an origin. From a defender's perspective, the challenge is not to detect automation in the abstract. It is to estimate whether a request is authorised, proportionate, and consistent with the service's terms and risk model.
+A request is an observation, not a complete identity. The source IP is a network attribute; a User-Agent string is a self-declared client label; a TLS fingerprint is a summary of a handshake; and a JavaScript challenge result is evidence that some execution environment performed a task. None of these independently proves that a human is present, that a client is benign, or that the request should be blocked. Strong systems combine signals with different failure modes and retain the ability to revise a decision as more evidence arrives.
+Design principle  Prefer a risk estimate assembled from independent evidence over a brittle rule such as “block every request without a browser User-Agent.”
+
+2. A layered view of a web request
+A browser request passes through several observable layers. Each layer exposes a different class of evidence and has different operational limits.
+•	Network and transport: source address, connection reuse, TCP characteristics where visible, TLS version and extensions, ALPN negotiation, and handshake consistency.
+•	HTTP protocol: HTTP/1.1 versus HTTP/2 or HTTP/3, header fields, field casing where applicable, ordering, pseudo-header behaviour, compression choices, and connection-level patterns.
+•	Application request: method, path, query parameters, cookies, authentication state, content type, request body shape, and whether the request is valid in the current workflow.
+•	Browser runtime: JavaScript execution, storage APIs, feature availability, rendering-related properties, and consistency between client-side state and server-side expectations.
+•	Behaviour over time: request cadence, navigation sequence, retries, dwell time, pagination patterns, concurrency, and the relationship between page loads and subsequent API calls.
+•	Account and business context: age of the session, account history, permissions, prior abuse indicators, endpoint sensitivity, and the cost of a false positive.
+The value of layering comes from disagreement. A browser-like User-Agent paired with a TLS stack that is uncommon for browsers may be informative, but it is not conclusive. A coherent browser handshake paired with an impossible application sequence can also be suspicious. Conversely, a command-line client that authenticates through a documented API, respects rate limits, and follows an approved access pattern may be entirely legitimate.
+3. TLS fingerprints: what JA3 actually represents
+Transport Layer Security (TLS) protects application traffic and negotiates cryptographic parameters before most HTTP content can be exchanged. During a TLS handshake, the client sends a ClientHello containing values such as the supported TLS versions, cipher suites, extension identifiers, supported groups, and signature algorithms. The exact combination and ordering of these fields can vary by TLS implementation, version, platform, configuration, and the software that constructs the handshake.
+JA3 is a fingerprinting technique that serialises selected ClientHello attributes into a canonical string and hashes that string, traditionally with MD5, to produce a compact identifier. The hash is not a cryptographic identity and should not be interpreted as a stable device ID. It is a convenient index into a population of observed handshake shapes. Two different clients can share a JA3 value, and one client can produce different values after a library upgrade, configuration change, or network-stack change.
+3.1 Why defenders use it
+TLS fingerprints are useful because many automation libraries use TLS stacks that differ from the stacks used by mainstream browsers. If an application claims to be a recent desktop browser but the handshake resembles a common scripting-library profile, the mismatch can increase risk. At scale, a service may also see clusters of traffic sharing the same unusual fingerprint, especially when the requests target a narrow set of endpoints at high volume.
+The signal is most useful as a feature in a larger model. A fingerprint can help group similar clients, support anomaly investigation, and distinguish broad client families. It does not reveal the full TLS session, the operator's identity, the page content, or intent. It is also affected by intermediaries: a corporate proxy, CDN, TLS inspection device, or forward proxy can terminate and re-establish TLS, changing what the origin observes.
+3.2 Limitations and false positives
+•	Fingerprint collisions: distinct implementations can map to the same compact fingerprint.
+•	Version churn: browsers and TLS libraries evolve; legitimate traffic can change abruptly after updates.
+•	Configuration diversity: enterprise policies, privacy software, operating systems, and custom builds create valid variants.
+•	Protocol evolution: TLS 1.3, GREASE values, extension handling, and newer transports complicate simplistic comparisons.
+•	Visibility boundaries: the component collecting the fingerprint may observe a proxy or edge connection rather than the original client.
+JA3 should therefore be treated as a noisy categorical feature, not as an allow/deny list of software. Operators should monitor the distribution of fingerprints over time, record the collection point, and avoid assigning a fixed meaning to a hash without corroborating evidence. JA4 and related approaches attempt to provide more structured and robust fingerprints, but they are still observations of protocol behaviour rather than proof of intent.
+4. HTTP fingerprints: header order, semantics, and protocol details
+HTTP headers appear simple because they are presented as text, but their construction depends on the client implementation and negotiated protocol. Browsers generate requests through a complex stack involving fetch/navigation rules, cookie policy, cache state, security features, and protocol negotiation. A generic HTTP library exposes a different set of defaults and may omit browser-generated context unless the application explicitly supplies it.
+4.1 Header ordering is evidence, not a signature of guilt
+In HTTP/1.1, headers are sent as a sequence of field lines. Libraries often emit them in an implementation-specific order, and that order can remain stable across requests. Some systems compare the observed ordering with distributions associated with known client families. This can help identify inconsistencies between a claimed browser and the actual request-construction stack.
+The caveat is important: HTTP semantics generally do not assign application meaning to most header ordering. Intermediaries can normalise, remove, add, or reorder fields. HTTP/2 and HTTP/3 use binary framing and pseudo-headers, so their wire representation is not equivalent to a plain HTTP/1.1 header block. A detector that treats one order as universally correct will age badly and can punish legitimate clients.
+4.2 Header presence and consistency
+Presence and internal consistency are often more useful than any single field's position. Examples include a navigation request that carries a plausible Accept value, a request's Sec-Fetch-* fields matching its apparent destination and mode, a cookie being sent only after a session was established, and a content type matching the body. These are contextual checks, not universal requirements: browser versions differ, privacy settings vary, and non-browser clients legitimately omit browser-specific fields.
+A service should ask whether the request is coherent for its claimed role. A JSON API call made by an approved integration should not be judged by the same template as a top-level navigation from a desktop browser. The expected request shape belongs to the endpoint and workflow, not to a single global notion of a “real browser.”
+5. The plain requests call versus a browser
+Python's requests package is a general-purpose HTTP client. It is well suited to APIs, scripts, test fixtures, and controlled data retrieval. A browser is a much larger runtime: it negotiates transport protocols, manages cookies and cache, applies navigation and fetch rules, runs JavaScript, loads subresources, and maintains state across a user journey. Comparing them is useful because the differences are structural, not merely cosmetic.
+5.1 What a server can commonly observe
+Observation	Typical plain HTTP client	Typical interactive browser
+TLS implementation	Uses the TLS stack provided by its runtime/dependencies; profile may differ from browsers.	Uses the browser/platform networking stack, with version- and platform-specific behaviour.
+User-Agent	Often identifies a library or Python runtime unless changed by the application.	Usually identifies a browser family and platform, though the string is not proof of identity.
+Browser-specific headers	Generally absent unless the client explicitly sends them.	May include navigation/fetch metadata and browser-generated fields where applicable.
+JavaScript	Does not execute page JavaScript by default.	Executes scripts and maintains runtime state.
+Cookies and storage	Can store and resend cookies, but does not automatically reproduce the browser's full storage and policy model.	Manages cookies, local/session storage, cache, and site policies.
+Subresources	Usually requests only what the script asks for.	May request HTML, CSS, scripts, images, fonts, APIs, and other resources.
+Navigation sequence	Depends on script logic; often direct and repetitive.	Can produce a richer sequence, though automation and extensions can change it.
+Protocol negotiation	Depends on library and runtime support.	Depends on browser, platform, and network conditions; often negotiates modern protocols.
+These are typical tendencies, not universal rules. A requests session can persist cookies and follow redirects; a browser can be launched in automation; and some browsers may use HTTP/1.1 because of a proxy or network constraint. The detector should evaluate the complete observation in context rather than assuming that any one implementation always behaves the same way.
+6. A safe, reproducible local experiment
+The following demonstration compares a Python HTTP client and a browser against a tiny local endpoint. It records only request metadata received by the local server. It does not target a public website, attempt to defeat a challenge, or alter TLS fingerprints. The goal is to observe the evidence a server application can collect at the HTTP layer and to understand the limits of that evidence.
+Important boundary  The example below observes HTTP headers only. It does not capture the TLS ClientHello, so it cannot calculate JA3. TLS fingerprint collection belongs at a TLS-terminating proxy or server component that has access to the handshake.
+
+6.1 Create the observation endpoint
+Save this as observer.py. It prints a request method, path, client address, and received headers, then returns a small JSON response.
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+
+class Observer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        record = {
+            "method": self.command,
+            "path": self.path,
+            "client_address": self.client_address[0],
+            "http_version": self.request_version,
+            "headers": list(self.headers.items()),
+        }
+
+        print(json.dumps(record, indent=2))
+        body = json.dumps({
+            "ok": True,
+            "message": "Request metadata recorded locally",
+            "header_count": len(record["headers"]),
+        }).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        # Keep the console output focused on the structured record above.
+        return
+
+if __name__ == "__main__":
+    server = HTTPServer(("127.0.0.1", 8080), Observer)
+    print("Listening on http://127.0.0.1:8080")
+    server.serve_forever()
+Run it with Python, then open the local address in a browser. The endpoint binds to loopback (127.0.0.1), so it is intended for the same machine.
+python observer.py
+6.2 Send a request with requests
+In a second terminal, run the following client. It deliberately uses the library's ordinary defaults rather than trying to imitate a browser.
+import requests
+
+response = requests.get("http://127.0.0.1:8080/demo", timeout=5)
+print("Status:", response.status_code)
+print("Response:", response.json())
+Inspect the server console. Depending on the installed requests and urllib3 versions, the User-Agent commonly identifies the Python client stack. The request will normally contain a comparatively small header set, and no browser JavaScript will run. The exact output varies by dependency version, configuration, and platform; record the actual output instead of treating a sample header list as a universal baseline.
+6.3 Send a request from a browser
+Open http://127.0.0.1:8080/demo in a normal browser tab. Compare the newly printed record with the requests record. A browser request may include a different User-Agent, Accept and Accept-Encoding values, language preferences, cache-related fields, or browser-specific metadata. Which fields appear depends on the browser, version, navigation type, privacy settings, and whether the request is a top-level navigation or a fetch call.
+The experiment is intentionally modest. Because it uses plain HTTP on loopback, it exposes no TLS handshake to inspect and does not reproduce the protocol negotiation or edge-layer observations available on a production HTTPS service. It is nevertheless enough to demonstrate that a server sees the request as constructed by the client, not the intentions of the person or program behind it.
+6.4 What to record in a comparison
+•	User-Agent value and whether it is consistent with the stated client.
+•	Header names present in each request, without assuming that more headers means more legitimate traffic.
+•	Header order as observed by this particular HTTP server; note that intermediaries and protocol versions can change the result.
+•	HTTP version reported by the server library, recognising that this local HTTP/1.1 server cannot demonstrate HTTP/2 or HTTP/3.
+•	Whether the client sends cookies or follows redirects when the experiment is extended.
+•	How repeated requests differ, including connection reuse and state, while avoiding claims that a small sample establishes a stable fingerprint.
+7. Why browser execution adds another evidence layer
+A page can deliver a challenge or initialise state through JavaScript. The browser may receive a token, calculate a value, update a cookie, or call an endpoint that is not part of the initial HTML response. Later requests can then be evaluated against that state. This gives the server more context than the headers on one isolated request, but it does not provide an absolute human-versus-machine test: automation frameworks execute JavaScript, and legitimate browsers can block scripts or storage.
+Browser-side signals can include feature availability, consistency among APIs, storage continuity, timing relationships, and whether expected application code appears to have run. Some signals are sensitive to privacy protections and browser changes. A defensive system should minimise collection, document the purpose of each signal, and avoid treating unusual or privacy-preserving configurations as inherently malicious.
+7.1 State continuity matters
+A session is more informative than a single hit. Consider a workflow that normally starts with a landing page, establishes a session, loads a product page, and then calls a JSON endpoint. A client that repeatedly calls the final endpoint without the expected state may be anomalous. However, direct API access may be valid for a documented integration, and cached pages or deep links may skip steps. The correct expectation must be defined per route and product behaviour.
+8. Behavioural signals: sequences beat isolated thresholds
+Behavioural analysis examines how requests relate to one another. A high request rate can be a signal, but it is a blunt one: a user on a fast connection, a screen reader, a search engine, or a batch export may produce bursts. Better analysis combines cadence with endpoint mix, concurrency, session age, error rates, navigation transitions, and the business sensitivity of the resource.
+8.1 Useful feature families
+•	Rate and burst shape: requests per interval, burst duration, and recovery after a rate-limit response.
+•	Endpoint distribution: proportion of static assets, HTML pages, API calls, search queries, and sensitive actions.
+•	Sequence plausibility: whether the observed route transitions are common for the workflow and account type.
+•	Session continuity: cookie and token persistence, authentication transitions, and state changes over time.
+•	Error and retry behaviour: repeated 4xx/5xx responses, malformed parameters, retries without backoff, and repeated challenge failures.
+•	Concurrency: parallel requests per session or identity, especially when the service expects sequential state changes.
+•	Resource efficiency: repeated downloads of identical content, cache bypass patterns, and unusually broad enumeration of identifiers.
+A useful model separates features that describe the client from features that describe the activity. A client fingerprint may be stable across many sessions, while the request sequence changes with the task. Conflating these can cause a detector to overgeneralise from a shared network or common software version.
+8.2 Modelling the sequence
+A simple first version may use transparent rules and rolling counters. For example, a service might calculate a weighted risk score from a rate anomaly, a session-state inconsistency, and repeated invalid requests. More mature systems can use supervised models or anomaly detection, but model complexity does not remove the need for clear labels, representative data, calibration, and monitoring. If labels are generated by the previous detector, the new model can inherit its blind spots.
+For sequence-sensitive systems, a useful abstraction is a state machine. The application defines states such as anonymous, session-established, authenticated, and transaction-pending, along with valid transitions. A request that violates a transition can be challenged, logged, or denied depending on the endpoint. This approach is often easier to audit than a black-box score alone because the expected workflow is explicit.
+9. IP reputation, identity, and the limits of network attribution
+Source IP reputation can add useful context, especially when a network is associated with known abuse or when a single source generates an extreme request rate. But IP addresses are shared and dynamic. Carrier-grade NAT, campus networks, offices, VPNs, residential gateways, and cloud egress can put many unrelated users behind one address. IPv6 privacy addresses and changing mobile networks complicate long-lived attribution further.
+Rate limiting solely by IP can therefore be unfair and ineffective. Depending on the application, a service may combine IP-level controls with account, session, API-key, device-family, and endpoint-level budgets. Each key has a different abuse and privacy profile. Account-based controls are more precise for authenticated workflows but can be bypassed through account creation or compromise; network controls can constrain anonymous abuse but risk collateral damage.
+10. Decisioning: detect, challenge, throttle, or allow
+Detection and enforcement should be separate stages. A risk signal describes uncertainty; a policy chooses an action. For low-risk traffic, the appropriate action may be to allow and observe. For moderate risk, a service might apply a lower rate limit or require a session check. For high-risk activity, it may deny a request or require stronger authentication. The response should reflect the cost of the resource and the confidence in the evidence.
+Risk posture	Possible response	Operational note
+Low / expected	Allow; retain proportionate telemetry	Keep logging minimal and respect retention policy.
+Uncertain / elevated	Soft rate limit, session validation, or accessible challenge	Measure completion and abandonment to identify false positives.
+High / corroborated	Block, require authentication, or isolate the session	Provide an appeal or recovery path where practical.
+Known approved integration	Use documented API access and explicit quotas	Prefer stable credentials and published limits over browser imitation.
+A CAPTCHA or JavaScript challenge is not free. It adds latency, can fail for assistive technologies, and can create friction for users with strict privacy settings. Challenges should be reserved for cases where the expected reduction in abuse outweighs the user cost. For an API intended for partners, an API key, OAuth flow, or signed request scheme is usually more reliable than trying to infer whether the caller resembles a browser.
+11. Building a detection pipeline that can be operated
+A production design needs more than a collection of features. It needs consistent telemetry, safe storage, versioning, and a way to learn from mistakes. A practical pipeline can be divided into the following stages:
+1.	Ingestion: collect edge and application events with a common request or trace identifier.
+2.	Normalisation: standardise timestamps, protocol labels, endpoint names, and missing-value handling while preserving raw evidence where justified.
+3.	Feature extraction: calculate rolling rates, sequence transitions, client-family categories, and session-level counters.
+4.	Risk evaluation: combine evidence using auditable rules or a calibrated model, with different policies for different endpoint classes.
+5.	Policy enforcement: allow, throttle, challenge, authenticate, or deny according to risk and business impact.
+6.	Feedback: review appeals, confirmed abuse, challenge outcomes, and false-positive reports.
+7.	Monitoring: watch traffic distributions, action rates, model drift, latency, and the effects of software/browser releases.
+Telemetry quality is a common limiting factor. If the edge records TLS metadata but the application logs cannot associate it with a session, the signal is difficult to use safely. If timestamps differ across systems, sequence analysis becomes unreliable. If a proxy rewrites headers but the pipeline does not record that fact, analysts may attribute the proxy's behaviour to the client. Instrumentation should document where each field was observed and whether it was transformed.
+12. Evaluation: false positives are a security metric too
+A detector that blocks every suspicious request can look effective if its only metric is the number of requests denied. That metric says little about service quality. Evaluation should include precision, recall, false-positive rate, challenge completion, appeal outcomes, latency, and the rate at which legitimate sessions are interrupted. The right trade-off varies: a public product catalogue has different consequences from a payment or account-recovery endpoint.
+Where possible, deploy new rules in shadow mode before enforcement. Compare their scores with known outcomes, sample borderline cases, and segment results by browser family, geography, network type, accessibility-related usage where appropriately and lawfully measured, and endpoint. Segmentation can reveal that a rule works well overall but disproportionately affects one legitimate cohort.
+Changes to browsers, TLS libraries, CDNs, and proxies can shift baseline distributions. A fingerprint that was rare last month may become common after a browser release. Detection systems need drift monitoring and controlled updates rather than permanent assumptions encoded into a blocklist.
+13. Common implementation mistakes
+•	Treating the User-Agent as identity. It is a client-supplied label and should never be the sole basis for a decision.
+•	Using a JA3 hash as a permanent device identifier. Fingerprints collide, change, and may represent an intermediary.
+•	Assuming header order has universal meaning. Protocol version, library behaviour, and intermediaries all matter.
+•	Equating JavaScript execution with a human. Automation can run scripts, and real users can have scripts disabled.
+•	Using one request-rate threshold for every route. Search, static assets, login, and bulk export have different traffic profiles.
+•	Ignoring session and workflow context. An isolated request can be ambiguous; a sequence may provide stronger evidence.
+•	Failing to account for shared networks. Campus, enterprise, and mobile carrier addresses can represent many legitimate users.
+•	Deploying an opaque model without monitoring. A model can drift, encode historical bias, or become difficult to troubleshoot.
+•	Collecting more data than necessary. Fingerprinting and behavioural telemetry should be proportionate, documented, access-controlled, and retained only as needed.
+14. Privacy, governance, and responsible data collection
+Fingerprinting can contribute to tracking when combined across sites or retained longer than necessary. Even where a signal is technically available, collecting it is not automatically justified. Teams should define the purpose, document the lawful basis where applicable, limit access, establish retention periods, and consider whether coarser features would achieve the same protective goal. Hashing a fingerprint does not make it anonymous if it remains linkable across sessions.
+A defensible anti-abuse programme also distinguishes unauthorised scraping from legitimate automated access. Publish API terms and rate limits where feasible, provide a contact path for researchers and partners, and avoid designing controls that depend on users disguising their tools. If a dataset is intended for public access, a stable, documented interface can reduce both server load and incentives for brittle scraping.
+15. A compact reference architecture
+A reasonable architecture places protocol observations at the edge, application context in the service, and policy decisions in a central or consistently versioned layer. The edge can record the observed TLS fingerprint, negotiated protocol, source network, and request metadata. The application can contribute route, authentication state, session age, and business context. A feature service can calculate rolling aggregates, while a policy engine decides whether to allow, throttle, challenge, or deny. Logs should preserve the decision rationale at a level useful for audit without unnecessarily exposing sensitive data.
+Request
+  |
+  v
+Edge / TLS termination
+  - observed handshake metadata
+  - negotiated HTTP protocol
+  - source network and request fields
+  |
+  v
+Application context
+  - route and method
+  - authentication / session state
+  - workflow and resource sensitivity
+  |
+  v
+Feature + risk layer
+  - rate and sequence aggregates
+  - consistency checks
+  - calibrated risk estimate
+  |
+  v
+Policy engine
+  - allow
+  - throttle
+  - challenge / authenticate
+  - deny
+  |
+  v
+Feedback and monitoring
+  - false-positive review
+  - drift and release monitoring
+  - policy performance metrics
+This separation helps teams change a rule without rewriting instrumentation, compare policy versions, and explain an action to an analyst. It also makes it easier to keep the collection point explicit: TLS features come from the TLS terminator, while session and workflow features come from the application.
+16. Conclusions
+Modern anti-bot detection is best understood as layered evidence analysis. TLS fingerprints can help identify transport-stack families; HTTP headers and protocol behaviour can reveal client construction patterns; browser execution can establish additional state; and request sequences can show whether activity fits the service's expected workflows. Every layer has limitations, and each becomes more useful when interpreted alongside independent evidence.
+The local requests-versus-browser experiment illustrates the first practical lesson: the server observes implementation details, not a client's stated intention. It also demonstrates the second lesson: a difference is not automatically an offence. A plain HTTP library is a legitimate tool, and a browser can be automated. The security decision belongs to the service's authorisation model, traffic policy, and risk context.
+The strongest systems are therefore not those with the longest list of fingerprints. They are those that define expected behaviour per workflow, collect only useful evidence, correlate signals with known limitations, respond proportionately, and continuously measure the cost of false positives. That combination is more durable than any single header rule or static hash list.
+Appendix A — Questions an engineer should ask before trusting a signal
+•	Where exactly was this value observed: client, proxy, CDN, TLS terminator, or application?
+•	Can a legitimate browser, corporate proxy, privacy tool, or approved integration produce the same value?
+•	How often does the signal change after ordinary software updates?
+•	Is the signal independent of the other features in the model, or are several features measuring the same underlying behaviour?
+•	What is the measured false-positive rate on representative legitimate traffic?
+•	What action will be taken, and is that action reversible or recoverable?
+•	How long is the raw signal retained, who can access it, and is the retention period justified?
+•	Is there a documented route for approved automated clients to obtain access without pretending to be a browser?
+Appendix B — Suggested experiment worksheet
+For a clean report, run the local experiment on your own machine and fill in the observed values below. Do not copy an assumed output: client versions change.
+Field	requests client	Browser
+User-Agent	 	 
+Accept	 	 
+Accept-Encoding	 	 
+Accept-Language	 	 
+Browser-specific fields present?	 	 
+HTTP version observed	 	 
+Cookies present?	 	 
+Other notes	 	 
+References and further reading
+•	RFC 8446 — The Transport Layer Security (TLS) Protocol Version 1.3 — https://www.rfc-editor.org/rfc/rfc8446
+•	RFC 9110 — HTTP Semantics — https://www.rfc-editor.org/rfc/rfc9110
+•	RFC 9112 — HTTP/1.1 — https://www.rfc-editor.org/rfc/rfc9112
+•	RFC 9113 — HTTP/2 — https://www.rfc-editor.org/rfc/rfc9113
+•	RFC 9114 — HTTP/3 — https://www.rfc-editor.org/rfc/rfc9114
+•	JA3 — Salesforce Engineering, TLS client fingerprinting background — https://github.com/salesforce/ja3
+•	JA4+ — FoxIO, network fingerprinting documentation and implementation — https://github.com/FoxIO-LLC/ja4
+•	MDN — HTTP headers — https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers
+•	MDN — Fetch metadata request headers — https://developer.mozilla.org/en-US/docs/Glossary/Fetch_metadata_request_header
+•	Python requests documentation — https://requests.readthedocs.io/
+•	OWASP Automated Threats to Web Applications — https://owasp.org/www-project-automated-threats-to-web-applications/
+Editorial note: The local experiment is illustrative, not a production detector. Exact header values vary by operating system, Python and dependency versions, browser version, configuration, and the observation point. Validate all conclusions against measurements from the environment under study.
+
+ PART II — TECHNICAL DEEP DIVE AND REPRODUCIBLE LAB
+Supplement to the original article — original content retained in full
+17. How to use this supplement
+This supplement extends the original article with deeper implementation notes, a more complete local lab, a small sequence-analysis example, evaluation guidance, and a specialist glossary. The original 15-page article is preserved verbatim before this section. The code below is intended for systems you own or are explicitly authorised to test. It does not attempt to bypass third-party anti-bot controls.
+Important reproducibility rule: no experiment results are asserted here as if they had already been measured. Run the lab in your own environment, record the exact versions and outputs, and then add your observations to the worksheet in Section 20.
+18. Deeper protocol details that matter in practice
+18.1 TLS ClientHello: what is and is not observable
+A TLS ClientHello can contain the offered protocol versions, cipher suites, extension types, supported groups, signature algorithms, key-share information, and other parameters. Fingerprinting systems select and normalise some of these fields; they do not usually preserve every byte of the handshake as a universal client identity. A fingerprint is a derived feature whose meaning depends on the collection point, normalisation method, and population against which it is interpreted.
+A common engineering mistake is to assume an application handler can reconstruct the original ClientHello. After a TLS terminator accepts a connection, the application usually receives decrypted HTTP metadata, not the raw handshake. If a CDN, reverse proxy, service mesh, or TLS inspection appliance terminates TLS first, the origin may observe that intermediary's connection. A production design should document the exact observation point and securely pass only the needed, provenance-labelled metadata downstream.
+•	JA3 traditionally derives a compact identifier from selected ClientHello fields; GREASE values are excluded from the canonicalisation process.
+•	JA4 is a related fingerprinting family with a different, more structured representation. JA3 and JA4 values are not directly interchangeable.
+•	TLS 1.3 encrypts most handshake messages after ServerHello, but the ClientHello itself is visible to an on-path observer unless additional protections such as Encrypted ClientHello are in use.
+•	A shared fingerprint can reflect a common browser build, library, proxy, or deployment—not necessarily a shared person, device, or intent.
+For exact algorithms and current implementation details, use the primary JA3/JA4 project documentation and relevant TLS specifications listed in the original references. Do not implement a partial fingerprinting algorithm and label it JA3-compatible unless it follows the documented canonicalisation precisely.
+18.2 HTTP/1.1, HTTP/2, and HTTP/3 are different observation surfaces
+Header ordering is easiest to discuss for HTTP/1.1, where field lines are transmitted as text. HTTP/2 and HTTP/3 use binary framing and pseudo-headers; compression and protocol libraries affect what an application-level logger sees. An application framework may expose a normalised mapping rather than the original wire sequence. Therefore, a header-order experiment using Python's BaseHTTPRequestHandler can demonstrate what that handler receives over HTTP/1.1, but it cannot establish wire-level ordering for HTTP/2 or HTTP/3.
+Layer	Useful observations	Common blind spot
+TLS terminator / edge	Negotiated TLS version, cipher, ALPN, handshake-derived fingerprint where supported	May see a proxy or CDN connection rather than the end client
+HTTP parser	Method, target, fields, protocol version as exposed by the parser	Frameworks may normalise fields or discard wire-level details
+Application	Route, authentication state, session transitions, response outcomes	Usually cannot infer the original TLS ClientHello by itself
+Browser-side instrumentation	JavaScript state, feature results, challenge completion, client-side timing	Automation can execute JavaScript; privacy settings can change results
+Analytics pipeline	Correlated sequences and rolling aggregates	Bad identifiers or unsynchronised clocks can corrupt joins
+
+18.3 Header semantics versus fingerprints
+A field's meaning comes from its protocol definition and request context, not merely its position. For example, Fetch Metadata fields such as Sec-Fetch-Site, Sec-Fetch-Mode, and Sec-Fetch-Dest can help describe the context of a browser request. They are not universal requirements for all HTTP clients, and their absence is not proof of abuse. Similarly, Accept and Accept-Language can vary because of user preferences, privacy tools, browser versions, or the type of request.
+A sound detector compares like with like: top-level navigation with expected navigation patterns, API calls with the API's documented contract, and authenticated actions with the relevant session state. This reduces the risk of treating an approved integration as suspicious merely because it is not a browser.
+19. Reproducible local lab: improved implementation
+This lab records request metadata on loopback only. It is deliberately small enough to inspect. It does not collect TLS ClientHello data, emulate a third-party service, or try to evade a detector.
+19.1 Requirements
+•	Python 3.10 or later is recommended.
+•	Install the HTTP client dependency with: python -m pip install requests
+•	For the browser example, install Playwright with: python -m pip install playwright, then run: python -m playwright install chromium
+•	Use a terminal for the server and a second terminal for the client. Keep the server bound to 127.0.0.1.
+19.2 Local observation server — observer.py
+This version adds a timestamp and a request identifier, uses a threaded server for simple concurrent local tests, and returns JSON. It records only what the HTTP server receives. Do not expose this demonstration server to an untrusted network.
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import uuid
+ 
+class Observer(BaseHTTPRequestHandler):
+    server_version = "LocalObserver/1.0"
+ 
+    def do_GET(self):
+        record = {
+            "request_id": str(uuid.uuid4()),
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "client_address": self.client_address[0],
+            "method": self.command,
+            "path": self.path,
+            "http_version": self.request_version,
+            # This is the header representation exposed by Python's parser,
+            # not a guaranteed byte-for-byte capture of the wire.
+            "headers": list(self.headers.items()),
+        }
+ 
+        print(json.dumps(record, indent=2))
+        body = json.dumps({
+            "ok": True,
+            "request_id": record["request_id"],
+            "header_count": len(record["headers"]),
+            "note": "Local metadata only; no TLS fingerprint is captured."
+        }).encode("utf-8")
+ 
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+ 
+    def log_message(self, fmt, *args):
+        # Structured records above are easier to compare in this lab.
+        return
+ 
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("127.0.0.1", 8080), Observer)
+    print("Listening only on http://127.0.0.1:8080")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\\nStopping local observer.")
+    finally:
+        server.server_close()
+19.3 Ordinary requests client — requests_client.py
+import requests
+ 
+url = "http://127.0.0.1:8080/demo?source=requests"
+response = requests.get(url, timeout=5)
+ 
+print("Status:", response.status_code)
+print("Response:", response.json())
+print("Client-side request headers:")
+for name, value in response.request.headers.items():
+    print(f"{name}: {value}")
+Run the server first with python observer.py, then run python requests_client.py in another terminal. The server-side record is the main evidence for this comparison. The client-side printout is useful context, but it should not be confused with a packet capture.
+19.4 Browser request — browser_client.py
+from playwright.sync_api import sync_playwright
+ 
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    response = page.goto("http://127.0.0.1:8080/demo?source=playwright",
+                         wait_until="domcontentloaded")
+    print("Status:", response.status if response else "No main response")
+    print("Page title:", page.title())
+    browser.close()
+Run this script while the observer is active. Because the endpoint returns JSON rather than an HTML page, the browser may display the JSON response directly; that is expected. The main navigation request is the request to compare. A headless browser is still a browser runtime, but its traffic is not guaranteed to be identical to a user's everyday browser session.
+19.5 Capture a clean experiment record
+8.	Record the operating system, Python version, requests version, Playwright version, and browser version.
+9.	Start the observer and save its console output to a text file.
+10.	Send one requests request and one browser navigation request.
+11.	Repeat each request a few times to see which fields remain stable and which vary.
+12.	Change only one variable at a time, such as browser headless versus headed mode, and label each run.
+13.	Do not generalise from two requests to all Python clients or all browsers.
+Version commands: python --version; python -m pip show requests; python -m pip show playwright. For Playwright browser information, record the installed Playwright version and the browser binary version reported by your local environment.
+20. Results worksheet and interpretation discipline
+Complete this table after running the experiment. Leave fields blank until measured; do not copy sample values from another machine. Preserve raw output privately if it contains information you do not want to publish.
+Field	requests client	Browser client	Interpretation / caveat
+Run ID and timestamp			Use the same clock source and label each run.
+Python / library / browser versions			Version differences can change results.
+User-Agent			Self-declared label; not identity proof.
+Accept			Depends on request type and client defaults.
+Accept-Encoding			Compression support can vary by client and runtime.
+Accept-Language			May reflect user or browser preferences.
+Sec-Fetch-* fields			Contextual browser metadata; not expected from every client.
+Header count / observed order			Order is only what the chosen parser exposes.
+HTTP version reported			The local server demonstrates HTTP/1.1, not HTTP/2 or HTTP/3.
+Cookies / redirects			Test only if you add a controlled local workflow.
+Unexpected result			Record it rather than forcing it to match an expectation.
+
+20.1 Example of sound interpretation
+Suppose the browser request contains more fields than the requests request. A defensible finding is: 'In this run, the local server observed additional fields in the browser navigation request.' A plausible interpretation is that the browser's navigation stack added context that the basic HTTP client did not send. An indefensible conclusion would be: 'The browser is human and requests is a bot.' The experiment measures request construction, not intent, authorisation, or human presence.
+21. A small, transparent sequence-risk demonstration
+The following example shows how a service could aggregate several weak signals into a transparent score. It uses synthetic, illustrative events and is not a production detector. Thresholds are arbitrary placeholders that must not be copied into a live service without validation. The example deliberately avoids treating a single IP, User-Agent, or request-rate observation as proof of abuse.
+21.1 Synthetic events and a simple scoring function
+from collections import Counter
+from dataclasses import dataclass
+from typing import Iterable
+ 
+@dataclass
+class Event:
+    session_id: str
+    route: str
+    status: int
+    seconds_since_previous: float
+    has_valid_session: bool
+ 
+def score_session(events: Iterable[Event]) -> tuple[int, list[str]]:
+    events = list(events)
+    reasons = []
+    score = 0
+ 
+    if not events:
+        return 0, ["no events to evaluate"]
+ 
+    # These are illustrative signals, not universal rules.
+    rapid = sum(e.seconds_since_previous < 0.25 for e in events[1:])
+    if rapid >= 5:
+        score += 2
+        reasons.append("repeated very short inter-request intervals")
+ 
+    invalid_responses = sum(400 <= e.status < 500 for e in events)
+    if invalid_responses >= 4:
+        score += 2
+        reasons.append("repeated client-error responses")
+ 
+    invalid_session = sum(not e.has_valid_session for e in events)
+    if invalid_session >= 3:
+        score += 3
+        reasons.append("repeated requests without expected session state")
+ 
+    route_counts = Counter(e.route for e in events)
+    if len(events) >= 10 and len(route_counts) == 1:
+        score += 1
+        reasons.append("highly repetitive route sequence")
+ 
+    return score, reasons
+ 
+if __name__ == "__main__":
+    sample = [
+        Event("demo-1", "/catalog", 200, 1.4, True),
+        Event("demo-1", "/catalog", 200, 0.18, True),
+        Event("demo-1", "/catalog", 404, 0.16, False),
+        Event("demo-1", "/catalog", 404, 0.14, False),
+        Event("demo-1", "/catalog", 404, 0.15, False),
+        Event("demo-1", "/catalog", 404, 0.17, False),
+        Event("demo-1", "/catalog", 200, 0.12, False),
+    ]
+    score, reasons = score_session(sample)
+    print("Illustrative score:", score)
+    print("Reasons:", reasons)
+    print("Decision: review the context; do not auto-block on this score alone.")
+This code is intentionally simple enough to audit. In a real service, event collection would need robust session identifiers, clock handling, route-specific expectations, safe logging, and protection against missing or duplicated events. The score should be calibrated on representative legitimate and abusive traffic, and the enforcement action should depend on endpoint sensitivity and the cost of a false positive.
+21.2 Why a score needs calibration
+•	Precision answers: of requests flagged, what proportion were actually abusive?
+•	Recall answers: of abusive requests, what proportion did the detector identify?
+•	False-positive rate answers: of legitimate requests, what proportion were incorrectly flagged?
+•	Calibration asks whether predicted risk levels correspond to observed outcome frequencies.
+•	Shadow mode lets engineers compare a proposed rule with real traffic without enforcing it immediately.
+•	Segment results by endpoint, client family, network type, and release period to uncover uneven impact.
+A higher score is not automatically a better detector. If the labels used for evaluation come only from an earlier detector, the new system can inherit the old system's mistakes. Use independent evidence such as confirmed abuse, analyst review, appeal outcomes, and carefully designed test traffic where available.
+22. Advanced failure modes and niche engineering considerations
+22.1 Fingerprint drift and population effects
+Fingerprints are population-dependent. A fingerprint may be common in one geography or enterprise fleet and rare in another. Browser rollouts can shift distributions quickly, while a proxy deployment can make many clients appear to share one transport profile. Store the observation time, collection point, and relevant version context so analysts can distinguish a real change in traffic from an instrumentation change.
+22.2 Correlated signals and double-counting
+A risk model can become overconfident when several features measure nearly the same underlying fact. For example, a library-specific User-Agent, a familiar header set, and a known TLS profile may all be consequences of the same client implementation. Treating them as three independent pieces of evidence exaggerates confidence. Evaluate feature correlation, document causal assumptions, and test whether each feature adds value beyond existing signals.
+22.3 Clock skew, retries, and event ordering
+Sequence analysis depends on trustworthy timestamps and stable correlation identifiers. Events from different services may arrive out of order; retries can create duplicate records; queues can delay logs; and clock skew can make intervals negative or implausible. Prefer monotonic clocks for durations measured within one process, synchronised wall clocks for cross-system correlation, explicit request IDs, and deduplication rules. Preserve missingness rather than silently replacing unknown values with zero.
+22.4 NAT, proxy chains, and identity scope
+A source address identifies a network observation, not necessarily a person or even one client. Carrier-grade NAT, campus networks, VPN gateways, corporate proxies, and CDNs can aggregate unrelated traffic. If the system trusts forwarded headers, it must accept them only from known proxy hops and define which proxy is authoritative; blindly trusting a client-supplied X-Forwarded-For value can let a requester forge apparent origin addresses.
+22.5 Challenge success is not proof of benign intent
+A successful JavaScript challenge indicates that the required computation or interaction completed in the observed environment. It does not prove a human was present or that subsequent activity is authorised. Conversely, challenge failure may be caused by script blocking, network errors, accessibility tooling, or privacy protections. Treat challenge outcomes as one event in the session history, and provide a recovery path for legitimate users.
+22.6 Rate limits should match the resource
+A single global threshold ignores differences between cheap reads, expensive searches, login attempts, bulk exports, and state-changing actions. Token-bucket and leaky-bucket algorithms are useful rate-control primitives, but their keys and budgets should reflect the threat model: account, API key, session, endpoint, network, or combinations. Distributed clients can spread load across keys, while shared networks can make IP-only budgets unfair.
+22.7 Privacy and data minimisation
+Fingerprinting data can become linkable when retained or joined across sessions. Before collecting a feature, document the security purpose, who can access it, retention duration, and whether a less granular feature would work. Avoid logging authentication secrets, full cookies, session tokens, or unnecessary request bodies in a demonstration. For public repositories, use synthetic data and remove environment-specific identifiers.
+23. Suggested repository structure for the open-source submission
+modern-anti-bot-detection/
+├── README.md
+├── article.md
+├── requirements.txt
+├── lab/
+│   ├── observer.py
+│   ├── requests_client.py
+│   └── browser_client.py
+├── analysis/
+│   └── sequence_risk_demo.py
+├── results/
+│   ├── README.md
+│   └── comparison-template.csv
+├── LICENSE
+└── .gitignore
+Keep the Word document as a readable publication artifact if you want, but make article.md the easy-to-review source version. Include a requirements file, exact run instructions, and a results template. Commit only results you actually measured. If you publish logs, inspect them first and remove personal or environment-specific data.
+23.1 Suggested requirements.txt
+requests>=2.31,<3
+playwright>=1.40
+For strict reproducibility, pin the exact versions you tested after running the lab, rather than treating the broad ranges above as a verified environment. Playwright also requires its browser binary to be installed separately.
+23.2 Suggested .gitignore
+__pycache__/
+.venv/
+venv/
+.env
+*.log
+results/raw/
+.DS_Store
+24. Pre-publication verification checklist
+•	☐ The original article is preserved; this supplement adds material rather than removing prior information.
+•	☐ All code blocks have been copied into files and run in the documented environment.
+•	☐ The local observer binds only to 127.0.0.1 and is not exposed publicly.
+•	☐ The results section contains only measurements actually collected.
+•	☐ The article clearly distinguishes protocol facts, observed results, and interpretations.
+•	☐ References are checked against the current primary documentation.
+•	☐ No cookies, credentials, tokens, personal data, or private target details are committed.
+•	☐ The repository has a clear license and a README with setup and reproduction instructions.
+•	☐ The final document and Markdown version agree on the technical claims.
+•	☐ The ticket message accurately describes the work that is present in the repository.
+25. Further specialist reading
+The original references remain part of the article. For a deeper implementation study, prioritise primary specifications and maintained project documentation over unsourced blog summaries.
+•	TLS 1.3 specification (RFC 8446): https://www.rfc-editor.org/rfc/rfc8446
+•	HTTP Semantics (RFC 9110): https://www.rfc-editor.org/rfc/rfc9110
+•	HTTP/1.1 Message Syntax and Routing (RFC 9112): https://www.rfc-editor.org/rfc/rfc9112
+•	HTTP/2 (RFC 9113): https://www.rfc-editor.org/rfc/rfc9113
+•	HTTP/3 (RFC 9114): https://www.rfc-editor.org/rfc/rfc9114
+•	JA3 project and implementation notes: https://github.com/salesforce/ja3
+•	JA4+ documentation and implementation: https://github.com/FoxIO-LLC/ja4
+•	Python requests documentation: https://requests.readthedocs.io/
+•	Playwright for Python: https://playwright.dev/python/
+•	OWASP Automated Threats to Web Applications: https://owasp.org/www-project-automated-threats-to-web-applications/
+Final note
+The strongest version of this project will combine the preserved article, a working local lab, measured results, and honest limitations. The added code demonstrates methodology; it does not replace running the experiment. Update the results worksheet with your own observations before presenting the repository as a completed empirical study.
 
